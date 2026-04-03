@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs wc:*)",
+      "Bash(git -C /e/programing/nanochat log --oneline)"
+    ]
+  }
+}
