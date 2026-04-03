@@ -57,12 +57,12 @@ python -m nanochat.dataset -n 8
 # Immediately also kick off downloading more shards in the background while tokenizer trains
 # Approximately 150 shards are needed for GPT-2 capability pretraining, add 20 for padding.
 # The maximum total number of shards available in the entire dataset is 6542.
-python -m nanochat.dataset -n 170 &
+python -m nanochat.dataset -n 170 &         
 DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
+python -m scripts.tok_train     # 这里需要看一下，完成了什么工作？
 # evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+python -m scripts.tok_eval      # 这里是对训练好的tokenizer进行评估，报告压缩率等指标
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
