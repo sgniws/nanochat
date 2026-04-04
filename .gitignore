@@ -14,3 +14,15 @@ wandb/
 
 # data
 base_data_climbmix/
+
+
+base_checkpoints/
+chatsft_checkpoints/
+base_eval/
+evals_bundle.zip
+*.zip
+*.zip.lock
+*.txt.lock
+words_alpha.txt
+identity_conversations.jsonl
+report/
