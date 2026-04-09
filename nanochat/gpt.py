@@ -95,6 +95,8 @@ class CausalSelfAttention(nn.Module):
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        # cos_sin是预先计算好的旋转嵌入(tuple二元组)，形状为(cos, sin)，每个都是(1, seq_len, 1, head_dim/2)
+        # 在GPT的forward函数中根据当前序列长度进行切片
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
@@ -121,7 +123,7 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
+        y = y.contiguous().view(B, T, -1) # contiguous 确保内存连续，view之前必须是连续的
         y = self.c_proj(y)
         return y
 
@@ -171,8 +173,9 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
-        })
-        self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        })      # <<== 这里有Block、MLP要看，我已经看完
+        # lm_head 是一个线性层，用于将Transformer的输出映射到词汇表大小的维度，生成每个位置上每个词的logits。
+        self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False) 
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -288,6 +291,11 @@ class GPT(nn.Module):
         Pattern string is tiled across layers. Final layer always gets L (full context).
         Characters: L=long (full context), S=short (quarter context)
         """
+        # 把像 "SSSL" 这样的字符串，翻译成真正的每层参数列表
+        # 例如 "SSSL" 就是 [S, S, S, L, S, S, S, L, ...] 以此类推，最后一层强制L
+        # [(512, 0), (512, 0), (512, 0), (2048, 0), ...]
+        # 注意FA3的window_size参数是一个(left, right)的tuple
+        # 表示当前token可以看到之前多少个token和之后多少个token，-1表示无限制，0表示不看
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes
@@ -394,7 +402,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
+        # Muon groups (matrix params, grouped by shape for stacking) Transformer block的主干矩阵参数走MuonAdamW优化器
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -409,7 +417,7 @@ class GPT(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
+        B, T = idx.size()   # idx是输入的token ids，是token编号，形状为(batch_size, seq_len)，T是当前输入序列的长度
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -419,12 +427,13 @@ class GPT(nn.Module):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
-        # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        # Embed the tokens, wte means "word token embedding"
+        x = self.transformer.wte(idx) # embed current token 这里根据idx查表得到输入的token embeddings，形状为(batch_size, seq_len, embedding_dim)
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
+        # Smear 把前一个token的embedding混入当前token的位置，提前给当前 token 一点前一个 token 的局部上下文信息。
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
@@ -449,20 +458,22 @@ class GPT(nn.Module):
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            # 每层都不只看当前表示，还会重新混入一点初始 embedding
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0 
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
+        # 去掉一些低层特征，再送去做 logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap] 平滑地将logits限制在[-softcap, softcap]范围内，防止极端值导致训练不稳定，同时保留足够的动态范围
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits[..., :self.config.vocab_size] # slice to remove padding，截取到原始的词汇表大小，去掉之前为了效率而添加的padding部分
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
@@ -483,6 +494,7 @@ class GPT(nn.Module):
         - batch size is 1
         - ids and the yielded tokens are simple Python lists and ints
         """
+        # 最原始的方式来生成文本，逐个token地生成，每次调用forward一次，适合理解和调试，但效率不高
         assert isinstance(tokens, list)
         device = self.get_device()
         rng = None
@@ -490,10 +502,10 @@ class GPT(nn.Module):
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
-        for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
-            if top_k is not None and top_k > 0:
+        for _ in range(max_tokens): # 每次生成一个token，最多生成max_tokens个
+            logits = self.forward(ids) # (B, T, vocab_size) 用当前输入tokens序列进行一次前向传播，得到logtis，形状为(batch_size, seq_len, vocab_size)，这里的seq_len是当前输入tokens的长度
+            logits = logits[:, -1, :] # (B, vocab_size), 只取最后一个位置的logits作为下一个token的预测，因为我们是逐个生成的，所以只关心最后一个位置的输出
+            if top_k is not None and top_k > 0: # top-k采样
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             if temperature > 0:

@@ -129,7 +129,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
                 remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
+                # Find largest doc that fits entirely 这里用到了best fit
                 best_idx = -1
                 best_len = 0
                 for i, doc in enumerate(doc_buffer):
